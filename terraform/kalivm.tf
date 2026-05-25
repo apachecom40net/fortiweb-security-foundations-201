@@ -211,8 +211,8 @@ resource "null_resource" "copy_go_files" {
       "echo 'Checking if Go is available...'",
       "which go || echo 'Go not in PATH'",
       "/usr/local/go/bin/go version || echo 'Go not found at /usr/local/go/bin/go'",
-      "echo 'Executing build script...'",
-      "/usr/local/bin/build-ml2.sh",
+      "echo 'Executing build script (sudo — writes to /usr/local/bin)...'",
+      "sudo /usr/local/bin/build-ml2.sh",
       "echo '=== DEBUG: Build process complete ==='"
     ]
   }

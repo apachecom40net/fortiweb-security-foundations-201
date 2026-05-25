@@ -1,164 +1,198 @@
 #cloud-config
 write_files:
-  # --- main post-provision script with logging ---
+  # --- main post-provision script with step tracking ---
   - path: /usr/local/bin/postprovision.sh
     permissions: "0755"
     content: |
       #!/usr/bin/env bash
-      set -euo pipefail
       LOG_FILE="/var/log/postprovision.log"
       mkdir -p "$(dirname "$LOG_FILE")"
       exec > >(tee -a "$LOG_FILE") 2>&1
       log(){ echo "[$(date -Is)] $*"; }
       export DEBIAN_FRONTEND=noninteractive
 
-      # Credentials injected by Terraform (kalivm.tf); must match the Linux account xrdp uses
+      # Credentials injected by Terraform (kalivm.tf)
       ADMIN_PW_B64='__ADMIN_PW_B64__'
       ADMIN_USER='__ADMIN_USERNAME__'
       NEW_PASS=$(printf '%s' "$ADMIN_PW_B64" | base64 -d)
-      log "=== Starting post-provision script (lab user: ${ADMIN_USER}) ==="
+      log "=== Starting post-provision (lab user: ${ADMIN_USER}) ==="
 
-      apt-get update -y || true
-      dpkg --configure -a || true
-      apt-get -f install -y || true
-      if ! dpkg -s plymouth >/dev/null 2>&1; then
-        apt-get install -y plymouth initramfs-tools || true
-      fi
-      update-initramfs -u || true
+      # ── Step tracking ──────────────────────────────────────────────────────
+      STEPS_OK=()
+      STEPS_FAIL=()
+      run_step() {
+        local name="$1"; shift
+        log ">>> STEP START: ${name}"
+        local rc=0
+        "$@" || rc=$?
+        if [ $rc -eq 0 ]; then
+          log ">>> STEP OK:   ${name}"
+          STEPS_OK+=("${name}")
+        else
+          log ">>> STEP FAIL: ${name} (rc=${rc})"
+          STEPS_FAIL+=("${name}")
+        fi
+      }
+      print_summary() {
+        log ""
+        log "========================================"
+        log "BOOTSTRAP SUMMARY (postprovision)"
+        log "========================================"
+        local total=$(( ${#STEPS_OK[@]} + ${#STEPS_FAIL[@]} ))
+        log "Steps: ${total} total  |  ${#STEPS_OK[@]} OK  |  ${#STEPS_FAIL[@]} FAIL"
+        log "----------------------------------------"
+        for s in "${STEPS_OK[@]}";   do log "  [OK]   ${s}"; done
+        for s in "${STEPS_FAIL[@]}"; do log "  [FAIL] ${s}"; done
+        log "========================================"
+        log "Full log: ${LOG_FILE}"
+      }
+      trap print_summary EXIT
 
-      apt-get install -y \
-        docker.io curl git jq netcat-openbsd \
-        python3 python3-dev python3-pip python3-venv \
-        wireshark wireshark-common burpsuite \
-        kali-desktop-xfce xrdp xorgxrdp xfce4 xfce4-goodies || true
-      # Install Postman via tarball test
-      log "Installing Postman via tarball..."
-      POSTMAN_URL="https://dl.pstmn.io/download/latest/linux64"
-      POSTMAN_DEST="/opt/Postman"
-      curl -fsSL "$POSTMAN_URL" -o /tmp/postman.tar.gz || { log "Failed to download Postman"; exit 1; }
-      tar -xzf /tmp/postman.tar.gz -C /opt/
-      ln -sf "$POSTMAN_DEST/Postman" /usr/local/bin/postman
-      log "Postman installed successfully"
-      
-      adduser xrdp ssl-cert || true
-      echo "allowed_users=anybody" > /etc/X11/Xwrapper.config
-      sed -i.bak '/^test -r \/etc\/X11\/Xsession/d;/^exec \/bin\/sh \/etc\/X11\/Xsession/d' /etc/xrdp/startwm.sh
-      grep -q '^startxfce4' /etc/xrdp/startwm.sh || echo "startxfce4" >> /etc/xrdp/startwm.sh
-      install -d -o labuser -g labuser /home/labuser
-      echo "startxfce4" > /home/labuser/.xsession
-      chown labuser:labuser /home/labuser/.xsession
-      systemctl enable --now xrdp xrdp-sesman || true
+      # ── 1. System update ───────────────────────────────────────────────────
+      step_apt_update() {
+        apt-get update -y
+        dpkg --configure -a
+        apt-get -f install -y
+      }
+      run_step "apt-get update + dpkg fix" step_apt_update
 
-      if ! command -v docker-compose >/dev/null 2>&1; then
-        curl -sSL https://github.com/docker/compose/releases/download/v2.29.1/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+      # ── 2. Plymouth / initramfs ────────────────────────────────────────────
+      step_plymouth() {
+        if ! dpkg -s plymouth >/dev/null 2>&1; then
+          apt-get install -y plymouth initramfs-tools
+        fi
+        update-initramfs -u
+      }
+      run_step "plymouth/initramfs" step_plymouth
+
+      # ── 3. Core packages ──────────────────────────────────────────────────
+      step_packages() {
+        apt-get install -y \
+          docker.io curl git jq netcat-openbsd \
+          python3 python3-dev python3-pip python3-venv \
+          wireshark wireshark-common burpsuite \
+          kali-desktop-xfce xrdp xorgxrdp xfce4 xfce4-goodies
+      }
+      run_step "install core packages" step_packages
+
+      # ── 4. Postman (non-fatal on download failure) ────────────────────────
+      step_postman() {
+        if ! curl -fsSL "https://dl.pstmn.io/download/latest/linux64" -o /tmp/postman.tar.gz; then
+          log "Postman download failed — skipping (non-fatal)"
+          return 0
+        fi
+        tar -xzf /tmp/postman.tar.gz -C /opt/
+        ln -sf /opt/Postman/Postman /usr/local/bin/postman
+        log "Postman installed"
+      }
+      run_step "install postman" step_postman
+
+      # ── 5. xrdp / xfce ───────────────────────────────────────────────────
+      step_xrdp() {
+        adduser xrdp ssl-cert || true
+        echo "allowed_users=anybody" > /etc/X11/Xwrapper.config
+        sed -i.bak \
+          '/^test -r \/etc\/X11\/Xsession/d;/^exec \/bin\/sh \/etc\/X11\/Xsession/d' \
+          /etc/xrdp/startwm.sh
+        grep -q '^startxfce4' /etc/xrdp/startwm.sh || echo "startxfce4" >> /etc/xrdp/startwm.sh
+        install -d -o "${ADMIN_USER}" -g "${ADMIN_USER}" "/home/${ADMIN_USER}"
+        echo "startxfce4" > "/home/${ADMIN_USER}/.xsession"
+        chown "${ADMIN_USER}:${ADMIN_USER}" "/home/${ADMIN_USER}/.xsession"
+        systemctl enable --now xrdp xrdp-sesman
+      }
+      run_step "xrdp/xfce setup" step_xrdp
+
+      # ── 6. docker-compose (curl -f to catch HTTP errors) ──────────────────
+      step_docker_compose() {
+        if command -v docker-compose >/dev/null 2>&1; then
+          log "docker-compose already in PATH: $(command -v docker-compose)"
+          return 0
+        fi
+        curl -fsSL \
+          https://github.com/docker/compose/releases/download/v2.29.1/docker-compose-linux-x86_64 \
+          -o /usr/local/bin/docker-compose
         chmod 755 /usr/local/bin/docker-compose
         ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
-      fi
+        log "docker-compose v2.29.1 installed"
+      }
+      run_step "docker-compose install" step_docker_compose
 
-      systemctl enable --now docker || true
-      usermod -aG docker labuser || true
-      for i in {1..60}; do
-        systemctl is-active --quiet docker && docker info >/dev/null 2>&1 && break
-        sleep 2
-      done
+      # ── 7. Docker daemon ──────────────────────────────────────────────────
+      step_docker() {
+        systemctl enable --now docker
+        usermod -aG docker "${ADMIN_USER}"
+        local i
+        for i in $(seq 1 60); do
+          systemctl is-active --quiet docker && docker info >/dev/null 2>&1 && return 0
+          sleep 2
+        done
+        log "Docker daemon not ready after 120s"
+        return 1
+      }
+      run_step "docker daemon" step_docker
 
-      # Install Go if not present
-      if ! /usr/local/go/bin/go version >/dev/null 2>&1; then
-        log "Go not found, installing Go 1.22.2..."
+      # ── 8. Go install ─────────────────────────────────────────────────────
+      step_go() {
+        if /usr/local/go/bin/go version >/dev/null 2>&1; then
+          log "Go already installed: $(/usr/local/go/bin/go version)"
+          return 0
+        fi
+        log "Installing Go 1.22.2..."
         cd /tmp
         rm -rf /usr/local/go
-        log "Downloading Go 1.22.2..."
         wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz
-        if [ ! -f go1.22.2.linux-amd64.tar.gz ]; then
-          log "ERROR: Failed to download Go"
-          exit 1
-        fi
-        log "Extracting Go to /usr/local..."
+        [ -f go1.22.2.linux-amd64.tar.gz ] || { log "Go tarball download failed"; return 1; }
         tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz
-        if [ ! -f /usr/local/go/bin/go ]; then
-          log "ERROR: Failed to extract Go"
-          exit 1
-        fi
-        log "Setting up Go PATH..."
-        grep -q '/usr/local/go/bin' /etc/profile || echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-        grep -q '^export GOPATH=' /etc/profile   || echo 'export GOPATH=/home/labuser/go'     >> /etc/profile
-        
-        # Update labuser's profile
-        grep -q '/usr/local/go/bin' /home/labuser/.bashrc || echo 'export PATH=$PATH:/usr/local/go/bin' >> /home/labuser/.bashrc
-        grep -q '^export GOPATH='  /home/labuser/.bashrc  || echo 'export GOPATH=/home/labuser/go'      >> /home/labuser/.bashrc
-        chown labuser:labuser /home/labuser/.bashrc
-        
-        # Update root's profile for automation scripts
-        grep -q '/usr/local/go/bin' /root/.bashrc || echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
+        [ -f /usr/local/go/bin/go ] || { log "Go extraction failed"; return 1; }
+        grep -q '/usr/local/go/bin' /etc/profile     || echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+        grep -q '^export GOPATH='   /etc/profile     || echo 'export GOPATH=/home/labuser/go'      >> /etc/profile
+        grep -q '/usr/local/go/bin' "/home/${ADMIN_USER}/.bashrc" \
+          || echo 'export PATH=$PATH:/usr/local/go/bin' >> "/home/${ADMIN_USER}/.bashrc"
+        grep -q '^export GOPATH='   "/home/${ADMIN_USER}/.bashrc" \
+          || echo "export GOPATH=/home/${ADMIN_USER}/go"  >> "/home/${ADMIN_USER}/.bashrc"
+        chown "${ADMIN_USER}:${ADMIN_USER}" "/home/${ADMIN_USER}/.bashrc"
+        grep -q '/usr/local/go/bin' /root/.bashrc  || echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
         grep -q '/usr/local/go/bin' /root/.profile || echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.profile
-        
-        # Create symlink in /usr/bin for system-wide access
-        ln -sf /usr/local/go/bin/go /usr/bin/go
+        ln -sf /usr/local/go/bin/go    /usr/bin/go
         ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
-        
-        # Set PATH directly in current session (avoid problematic profile sourcing)
-        log "Setting PATH directly for current session..."
         export PATH="/usr/local/go/bin:$PATH"
-        
-        # Verify Go is accessible
-        if /usr/local/go/bin/go version >/dev/null 2>&1; then
-          log "Go verification successful: $(/usr/local/go/bin/go version)"
-        else
-          log "ERROR: Go verification failed after PATH setup"
-          exit 1
-        fi
-        
-        log "Go installation completed successfully"
-      else
-        log "Go already installed at /usr/local/go/bin/go"
-      fi
-      
-      # Verify Go installation
-      if /usr/local/go/bin/go version >/dev/null 2>&1 || /usr/bin/go version >/dev/null 2>&1; then
-        GO_VERSION=$(/usr/local/go/bin/go version 2>/dev/null || /usr/bin/go version 2>/dev/null)
-        log "Go verification successful: ${GO_VERSION}"
-        log "Go available at: /usr/local/go/bin/go and /usr/bin/go"
-      else
-        log "ERROR: Go installation verification failed"
-        exit 1
-      fi
+        /usr/local/go/bin/go version >/dev/null 2>&1 || { log "Go post-install verify failed"; return 1; }
+        log "Go installed: $(/usr/local/go/bin/go version)"
+      }
+      run_step "go install" step_go
 
-      # Setup Guacamole
-      log "Setting up Guacamole..."
-      if [ ! -d /opt/guacamole ]; then
-        log "Cloning Guacamole repository..."
-        git clone --depth=1 https://github.com/boschkundendienst/guacamole-docker-compose /opt/guacamole
+      # ── 9. Guacamole clone + override ─────────────────────────────────────
+      step_guacamole_clone() {
         if [ ! -d /opt/guacamole ]; then
-          log "ERROR: Failed to clone Guacamole repository"
-          exit 1
+          git clone --depth=1 \
+            https://github.com/boschkundendienst/guacamole-docker-compose \
+            /opt/guacamole
         fi
-        log "Guacamole repository cloned successfully"
-      else
-        log "Guacamole directory already exists"
-      fi
-
-      # guacd cannot reliably reach the host via the Azure NIC IP (e.g. 10.0.0.4); use Docker host-gateway.
-      if [ -f /opt/guacamole/docker-compose.yml ]; then
+        [ -d /opt/guacamole ]                     || { log "Guacamole clone failed"; return 1; }
+        [ -f /opt/guacamole/docker-compose.yml ]  || { log "docker-compose.yml not found after clone"; return 1; }
         cat > /opt/guacamole/docker-compose.override.yml <<'GUAC_OVERRIDE'
 services:
   guacd:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 GUAC_OVERRIDE
-        log "Wrote /opt/guacamole/docker-compose.override.yml (guacd -> host.docker.internal for xrdp)"
-      fi
-      
-      log "Starting Guacamole services..."
-      cd /opt/guacamole
-      if [ -f prepare.sh ]; then
-        log "Running prepare script..."
-        bash -lc 'cd /opt/guacamole && zsh ./prepare.sh && docker-compose up -d' || log "Warning: Guacamole setup had issues (continuing)"
-      else
-        log "ERROR: prepare.sh not found in /opt/guacamole"
-        exit 1
-      fi
+        log "Wrote docker-compose.override.yml (guacd -> host.docker.internal)"
+      }
+      run_step "guacamole clone+override" step_guacamole_clone
 
-      wait_tcp() { local h="$1" p="$2" t="${3:-90}"; for i in $(seq 1 "$t"); do nc -z "$h" "$p" 2>/dev/null && return 0; sleep 1; done; return 1; }
+      # ── 10. Guacamole start ───────────────────────────────────────────────
+      step_guacamole_start() {
+        [ -f /opt/guacamole/prepare.sh ] || { log "prepare.sh not found in /opt/guacamole"; return 1; }
+        bash -lc 'cd /opt/guacamole && bash ./prepare.sh && docker-compose up -d'
+      }
+      run_step "guacamole start" step_guacamole_start
+
+      # ── 11. Guacamole API: wait + configure ───────────────────────────────
+      wait_tcp() {
+        local h="$1" p="$2" t="${3:-90}"
+        for i in $(seq 1 "$t"); do nc -z "$h" "$p" 2>/dev/null && return 0; sleep 1; done
+        return 1
+      }
       wait_http_tokens() {
         local u="$1" t="${2:-120}" code
         for i in $(seq 1 "$t"); do
@@ -171,174 +205,121 @@ GUAC_OVERRIDE
         return 1
       }
 
-      # Primary IPv4 (eth0/ens*/enP* on Azure); used for Guacamole nginx checks and RDP target
-      PRIMARY_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
-      [ -n "${PRIMARY_IP}" ] || PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-      HOST="${PRIMARY_IP}"
-      log "Detected primary IP: ${HOST:-unset}"
-      NGINX_HTTPS_PORT="$(docker port nginx_guacamole_compose 443/tcp | awk -F: '{print $2}' | head -n1 || true)"
-      GUAC_HTTP_PORT="$(docker port guacamole_compose 8080/tcp | awk -F: '{print $2}' | head -n1 || true)"
-      API_BASE=""
+      step_guacamole_api() {
+        PRIMARY_IP=$(ip -4 route get 1.1.1.1 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+        [ -n "${PRIMARY_IP}" ] || PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+        log "Primary IP: ${PRIMARY_IP:-unset}"
 
-      if [ -n "${NGINX_HTTPS_PORT}" ]; then
-        log "Waiting for nginx https://${HOST}:${NGINX_HTTPS_PORT}"
-        wait_tcp "${HOST}" "${NGINX_HTTPS_PORT}" 90 || true
-        if wait_http_tokens "https://${HOST}:${NGINX_HTTPS_PORT}/guacamole/api/tokens" 90; then
-          API_BASE="https://${HOST}:${NGINX_HTTPS_PORT}/guacamole"
+        NGINX_PORT="$(docker port nginx_guacamole_compose 443/tcp 2>/dev/null \
+          | awk -F: '{print $2}' | head -n1 || true)"
+        GUAC_PORT="$(docker port guacamole_compose 8080/tcp 2>/dev/null \
+          | awk -F: '{print $2}' | head -n1 || true)"
+        API_BASE=""
+
+        if [ -n "${NGINX_PORT}" ]; then
+          wait_tcp "${PRIMARY_IP}" "${NGINX_PORT}" 90 || true
+          wait_http_tokens "https://${PRIMARY_IP}:${NGINX_PORT}/guacamole/api/tokens" 90 \
+            && API_BASE="https://${PRIMARY_IP}:${NGINX_PORT}/guacamole"
         fi
-      fi
-
-      if [ -z "${API_BASE}" ] && [ -n "${GUAC_HTTP_PORT}" ]; then
-        log "Waiting for Tomcat http://127.0.0.1:${GUAC_HTTP_PORT}"
-        wait_tcp 127.0.0.1 "${GUAC_HTTP_PORT}" 90 || true
-        if wait_http_tokens "http://127.0.0.1:${GUAC_HTTP_PORT}/guacamole/api/tokens" 120; then
-          API_BASE="http://127.0.0.1:${GUAC_HTTP_PORT}/guacamole"
+        if [ -z "${API_BASE}" ] && [ -n "${GUAC_PORT}" ]; then
+          wait_tcp 127.0.0.1 "${GUAC_PORT}" 90 || true
+          wait_http_tokens "http://127.0.0.1:${GUAC_PORT}/guacamole/api/tokens" 120 \
+            && API_BASE="http://127.0.0.1:${GUAC_PORT}/guacamole"
         fi
-      fi
+        [ -n "${API_BASE}" ] || { log "Guacamole API unreachable after retries"; docker ps -a; return 1; }
+        log "Guacamole API base: ${API_BASE}"
 
-      if [ -z "${API_BASE}" ]; then
-        log "ERROR: Could not determine Guacamole API base URL after retries."
-        docker ps -a
-        exit 1
-      fi
-      log "Using Guacamole API base: ${API_BASE}"
+        TOKEN_JSON=$(curl -ksS -X POST "${API_BASE}/api/tokens" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data 'username=guacadmin&password=guacadmin' || true)
+        TOKEN_DEF=$(echo "${TOKEN_JSON}" | jq -r .authToken)
+        DS=$(echo "${TOKEN_JSON}"        | jq -r '.availableDataSources[0]')
 
-      TOKEN_JSON=$(curl -ksS -X POST "${API_BASE}/api/tokens" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        --data 'username=guacadmin&password=guacadmin' || true)
-      TOKEN_DEF=$(echo "${TOKEN_JSON}" | jq -r .authToken)
-      DS=$(echo "${TOKEN_JSON}" | jq -r '.availableDataSources[0]')
-
-      if [ -n "${TOKEN_DEF}" ] && [ "${TOKEN_DEF}" != "null" ]; then
-        log "Default login worked; changing password"
-        curl -ksS -X PUT "${API_BASE}/api/session/data/${DS}/users/guacadmin/password" \
-          -H "Guacamole-Token: ${TOKEN_DEF}" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n --arg old 'guacadmin' --arg new "${NEW_PASS}" '{oldPassword:$old,newPassword:$new}')" >/dev/null || true
-      else
-        log "Default login failed; password may already be changed"
-      fi
-
-      TOKEN_JSON=$(curl -ksS -X POST "${API_BASE}/api/tokens" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
-        --data "username=guacadmin&password=${NEW_PASS}" || true)
-      TOKEN=$(echo "${TOKEN_JSON}" | jq -r .authToken)
-      DS=$(echo "${TOKEN_JSON}" | jq -r '.availableDataSources[0]')
-      if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
-        log "ERROR: Login with new password failed; cannot proceed to create RDP connection"
-        exit 0
-      fi
-      log "Authenticated to Guacamole API with new password"
-
-      for i in {1..60}; do
-        ss -ltn | grep -q ':3389 ' && break
-        systemctl restart xrdp || true
-        sleep 5
-      done
-
-      DS=${DS:-postgresql}
-      NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' guacd_compose 2>/dev/null | head -n1 || true)
-      BRIDGE_GW=""
-      if [ -n "${NET}" ]; then
-        BRIDGE_GW=$(docker network inspect "${NET}" --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
-      fi
-      if [ -z "${BRIDGE_GW}" ] || [ "${BRIDGE_GW}" = "<no value>" ]; then
-        BRIDGE_GW=$(ip -4 addr show docker0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1 || true)
-      fi
-      # Do NOT use the VM VNet IP here (e.g. 10.0.0.4): guacd is on a Docker bridge and often cannot route there.
-      # docker-compose.override.yml adds host.docker.internal -> host-gateway for guacd.
-      RDP_HOST="host.docker.internal"
-      log "Guacamole RDP hostname: ${RDP_HOST} (PRIMARY_IP=${PRIMARY_IP:-unset} is not used for guacd->xrdp; bridge gw=${BRIDGE_GW:-unset}; net=${NET:-unset})"
-
-      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx guacd_compose; then
-        if H=$(docker exec guacd_compose getent hosts host.docker.internal 2>/dev/null); then
-          log "guacd host.docker.internal: ${H}"
+        if [ -n "${TOKEN_DEF}" ] && [ "${TOKEN_DEF}" != "null" ]; then
+          log "Default login OK; changing admin password"
+          curl -ksS -X PUT "${API_BASE}/api/session/data/${DS}/users/guacadmin/password" \
+            -H "Guacamole-Token: ${TOKEN_DEF}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg old 'guacadmin' --arg new "${NEW_PASS}" \
+                  '{oldPassword:$old,newPassword:$new}')" >/dev/null || true
         else
-          log "WARN: host.docker.internal missing inside guacd (Docker too old or extra_hosts not applied)"
+          log "Default login failed — password may already be changed"
         fi
-        if docker exec guacd_compose sh -c "command -v nc >/dev/null 2>&1 && nc -z -w 3 host.docker.internal 3389"; then
-          log "guacd reachability: tcp host.docker.internal:3389 OK"
+
+        TOKEN_JSON=$(curl -ksS -X POST "${API_BASE}/api/tokens" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data "username=guacadmin&password=${NEW_PASS}" || true)
+        TOKEN=$(echo "${TOKEN_JSON}" | jq -r .authToken)
+        DS=$(echo "${TOKEN_JSON}"    | jq -r '.availableDataSources[0]')
+        [ -n "${TOKEN}" ] && [ "${TOKEN}" != "null" ] \
+          || { log "Auth with new password failed — cannot create RDP connection"; return 1; }
+        log "Authenticated to Guacamole API"
+
+        for i in {1..60}; do
+          ss -ltn | grep -q ':3389 ' && break
+          systemctl restart xrdp || true
+          sleep 5
+        done
+
+        DS=${DS:-postgresql}
+        PAYLOAD=$(jq -n \
+          --arg host "host.docker.internal" \
+          --arg pass "${NEW_PASS}" \
+          --arg user "${ADMIN_USER}" \
+          '{name:"Lab Desktop",parentIdentifier:"ROOT",protocol:"rdp",
+            parameters:{hostname:$host,port:"3389",username:$user,password:$pass,
+              "ignore-cert":"true",security:"rdp","disable-nla":"true",
+              "enable-wallpaper":"false","resize-method":"display-update",
+              "color-depth":"24","enable-font-smoothing":"true"},
+            attributes:{}}')
+
+        curl_json() {
+          local m="$1" u="$2" d="${3:-}"
+          if [ -n "$d" ]; then
+            curl -ksS -H "Guacamole-Token: ${TOKEN}" -H "Content-Type: application/json" \
+                 -X "$m" -d "$d" "$u" -w $'\n%{http_code}'
+          else
+            curl -ksS -H "Guacamole-Token: ${TOKEN}" -X "$m" "$u" -w $'\n%{http_code}'
+          fi
+        }
+
+        BAC=$(curl_json GET "${API_BASE}/api/session/data/${DS}/connections?contains=Lab%20Desktop")
+        CODE="${BAC##*$'\n'}"; BODY="${BAC%$'\n'*}"; CID=""
+        [ "${CODE}" = "200" ] && \
+          CID=$(echo "${BODY}" | jq -r \
+            'if (type=="array" and length>0 and .[0]|has("identifier")) then .[0].identifier else empty end' \
+            2>/dev/null || true)
+
+        if [ -n "${CID}" ]; then
+          log "Updating existing 'Lab Desktop' connection (${CID})"
+          BAC=$(curl_json PUT "${API_BASE}/api/session/data/${DS}/connections/${CID}" "${PAYLOAD}")
+          CODE="${BAC##*$'\n'}"
+          [ "${CODE}" = "204" ] || log "WARN: PUT connection returned HTTP ${CODE}"
         else
-          log "WARN: guacd could not confirm tcp host.docker.internal:3389 (nc missing, xrdp down, or extra_hosts not applied — try: cd /opt/guacamole && docker compose up -d --force-recreate guacd)"
+          log "Creating 'Lab Desktop' connection"
+          BAC=$(curl_json POST "${API_BASE}/api/session/data/${DS}/connections" "${PAYLOAD}")
+          CODE="${BAC##*$'\n'}"
+          [ "${CODE}" = "200" ] || [ "${CODE}" = "201" ] || log "WARN: POST connection returned HTTP ${CODE}"
         fi
-      fi
 
-      # xrdp: avoid NLA / auto-negotiation issues with guacd (see Apache Guacamole + xrdp discussions)
-      PAYLOAD=$(jq -n --arg host "${RDP_HOST}" --arg pass "${NEW_PASS}" --arg user "${ADMIN_USER}" \
-        '{
-          name:"Lab Desktop",
-          parentIdentifier:"ROOT",
-          protocol:"rdp",
-          parameters:{
-            hostname:$host, port:"3389",
-            username:$user, password:$pass,
-            "ignore-cert":"true", security:"rdp",
-            "disable-nla":"true",
-            "enable-wallpaper":"false", "resize-method":"display-update",
-            "color-depth":"24", "enable-font-smoothing":"true"
-          },
-          attributes:{}
-        }')
-
-      curl_json() {
-        local m="$1" u="$2" d="${3:-}"
-        if [ -n "$d" ]; then
-          curl -ksS -H "Guacamole-Token: ${TOKEN}" -H "Content-Type: application/json" \
-               -X "$m" -d "$d" "$u" -w $'\n%{http_code}'
-        else
-          curl -ksS -H "Guacamole-Token: ${TOKEN}" -X "$m" "$u" -w $'\n%{http_code}'
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx guacd_compose; then
+          if H=$(docker exec guacd_compose getent hosts host.docker.internal 2>/dev/null); then
+            log "guacd resolves host.docker.internal: ${H}"
+          else
+            log "WARN: host.docker.internal missing inside guacd — check override file"
+          fi
+          if docker exec guacd_compose sh -c \
+               'command -v nc >/dev/null 2>&1 && nc -z -w 3 host.docker.internal 3389' 2>/dev/null; then
+            log "guacd -> host.docker.internal:3389 reachable OK"
+          else
+            log "WARN: guacd tcp:3389 check failed (nc missing, xrdp down, or override not applied)"
+          fi
         fi
       }
+      run_step "guacamole API configure" step_guacamole_api
 
-      BODY_AND_CODE=$(curl_json GET "${API_BASE}/api/session/data/${DS}/connections?contains=Lab%20Desktop")
-      CODE="${BODY_AND_CODE##*$'\n'}"
-      BODY="${BODY_AND_CODE%$'\n'*}"
-      CID=""
-      if [ "${CODE}" = "200" ]; then
-        CID=$(echo "${BODY}" | jq -r 'if (type=="array" and length>0 and .[0] | has("identifier")) then .[0].identifier else empty end' 2>/dev/null || true)
-      else
-        log "WARN: list connections returned HTTP ${CODE}"
-      fi
-
-      if [ -n "${CID}" ]; then
-        log "Updating existing 'Lab Desktop' (${CID})"
-        BODY_AND_CODE=$(curl_json PUT "${API_BASE}/api/session/data/${DS}/connections/${CID}" "${PAYLOAD}")
-        CODE="${BODY_AND_CODE##*$'\n'}"
-        [ "${CODE}" = "204" ] || log "WARN: update returned HTTP ${CODE}"
-      else
-        log "Creating 'Lab Desktop' connection"
-        BODY_AND_CODE=$(curl_json POST "${API_BASE}/api/session/data/${DS}/connections" "${PAYLOAD}")
-        CODE="${BODY_AND_CODE##*$'\n'}"
-        [ "${CODE}" = "200" ] || [ "${CODE}" = "201" ] || log "WARN: create returned HTTP ${CODE}"
-      fi
-
-      log "=== Building ML-2 tool ==="
-      # Build script will be executed by Terraform provisioners after files are copied
-      log "Build script installed, will be executed after file provisioning"
-      
-      # Wait for Go source files to be copied by Terraform provisioners
-      log "Waiting for Go source files to be available..."
-      for i in {1..30}; do
-        if [ -f /opt/mltool/ml-mix.go ] && [ -f /opt/mltool/ml2.go ] && [ -f /opt/mltool/bots.go ]; then
-          log "Go source files found, proceeding with build..."
-          break
-        fi
-        log "Waiting for source files... (attempt $i/30)"
-        sleep 10
-      done
-      
-      # Check if files are available before building
-      if [ ! -f /opt/mltool/ml-mix.go ] || [ ! -f /opt/mltool/ml2.go ] || [ ! -f /opt/mltool/bots.go ]; then
-        log "ERROR: Go source files not found after waiting. Build will be triggered later by Terraform provisioners."
-        exit 0
-      fi
-      
-      # Execute the build script
-      log "Executing build script..."
-      /usr/local/bin/build-ml2.sh
-
-      log "=== Post-provision script completed ==="
-
+      log "=== Post-provision script finished ==="
 
 
   - path: /opt/mltool/profiles.json
@@ -386,159 +367,157 @@ GUAC_OVERRIDE
     permissions: "0755"
     content: |
       #!/usr/bin/env bash
-      set -euo pipefail
-      echo "[build-ml2] $(date -Is) starting"
+      LOG_FILE="/var/log/build-ml2.log"
+      mkdir -p "$(dirname "$LOG_FILE")"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+      log(){ echo "[build-ml2] [$(date -Is)] $*"; }
+
       export PATH="/usr/local/go/bin:$PATH"
-      
-      # Create directory first, then set permissions
-      mkdir -p /opt/mltool
-      chmod 755 /opt/mltool
-      cd /opt/mltool
-      
-      # Set Go environment variables
       export GOCACHE="/tmp/go-build"
       export GOPATH="/tmp/go"
       export HOME="/root"
-      
-      # Build ML-2 tool (source files will be copied by Terraform provisioner)
-      echo "[build-ml2] $(date -Is) Building ML-2 tool"
-      
-      # Check if source file exists
-      if [ ! -f /opt/mltool/ml2.go ]; then
-        echo "[build-ml2] ERROR: ml2.go not found at /opt/mltool/ml2.go"
-        exit 1
-      fi
-      
-      # Create separate directory for ML-2 tool
-      mkdir -p /opt/mltool/ml2
-      cp /opt/mltool/ml2.go /opt/mltool/ml2/
-      cd /opt/mltool/ml2
-      
-      # Initialize Go module for ML-2 tool
-      go mod init ml2
-      go mod tidy
-      
-      # Build the ML-2 tool
-      echo "[build-ml2] $(date -Is) Compiling ML-2 tool..."
-      go build -trimpath -ldflags "-s -w" -o /usr/local/bin/ml-2 .
-      if [ $? -eq 0 ]; then
-        chmod +x /usr/local/bin/ml-2
-        echo "[build-ml2] $(date -Is) ML-2 tool build complete"
-      else
-        echo "[build-ml2] ERROR: Failed to build ML-2 tool"
-        exit 1
-      fi
-      
-      # Build Bots tool (source files will be copied by Terraform provisioner)
-      echo "[build-ml2] $(date -Is) Building Bots tool"
-      
-      # Check if source file exists
-      if [ ! -f /opt/mltool/bots.go ]; then
-        echo "[build-ml2] ERROR: bots.go not found at /opt/mltool/bots.go"
-        exit 1
-      fi
-      
-      # Create separate directory for bots tool
-      cd /opt/mltool
-      mkdir -p /opt/mltool/bots
-      cp /opt/mltool/bots.go /opt/mltool/bots/
-      cd /opt/mltool/bots
-      
-      # Initialize Go module for bots tool
-      go mod init bots
-      go mod tidy
-      
-      # Build the bots tool
-      echo "[build-ml2] $(date -Is) Compiling bots tool..."
-      go build -trimpath -ldflags "-s -w" -o /usr/local/bin/bots .
-      if [ $? -eq 0 ]; then
-        chmod +x /usr/local/bin/bots
-        echo "[build-ml2] $(date -Is) Bots tool build complete"
-      else
-        echo "[build-ml2] ERROR: Failed to build bots tool"
-        exit 1
-      fi
-      
-      # Build ML-Mix tool (source files will be copied by Terraform provisioner)
-      echo "[build-ml2] $(date -Is) Building ML-Mix tool"
-      
-      # Check if source file exists
-      if [ ! -f /opt/mltool/ml-mix.go ]; then
-        echo "[build-ml2] ERROR: ml-mix.go not found at /opt/mltool/ml-mix.go"
-        exit 1
-      fi
-      
-      # Create separate directory for ml-mix tool
-      cd /opt/mltool
-      mkdir -p /opt/mltool/ml-mix
-      cp /opt/mltool/ml-mix.go /opt/mltool/ml-mix/
-      cd /opt/mltool/ml-mix
-      
-      # Initialize Go module for ml-mix tool
-      go mod init ml-mix
-      go mod tidy
-      
-      # Build the ml-mix tool
-      echo "[build-ml2] $(date -Is) Compiling ml-mix tool..."
-      go build -trimpath -ldflags "-s -w" -o /usr/local/bin/ml-mix .
-      if [ $? -eq 0 ]; then
-        chmod +x /usr/local/bin/ml-mix
-        echo "[build-ml2] $(date -Is) ML-Mix tool build complete"
-        # Verify the binary works
-        /usr/local/bin/ml-mix --help 2>/dev/null || echo "[build-ml2] Warning: ml-mix binary may not be working correctly"
-      else
-        echo "[build-ml2] ERROR: Failed to build ml-mix tool"
-        exit 1
-      fi
-      
-      # Create logs dir (used by the tool profiles)
+
+      # ── Step tracking ──────────────────────────────────────────────────────
+      STEPS_OK=(); STEPS_FAIL=()
+      run_step() {
+        local name="$1"; shift
+        log ">>> STEP START: ${name}"
+        local rc=0; "$@" || rc=$?
+        if [ $rc -eq 0 ]; then
+          log ">>> STEP OK:   ${name}"; STEPS_OK+=("${name}")
+        else
+          log ">>> STEP FAIL: ${name} (rc=${rc})"; STEPS_FAIL+=("${name}")
+        fi
+      }
+      print_summary() {
+        log ""; log "========================================"
+        log "BUILD SUMMARY"
+        log "========================================"
+        log "Steps: $(( ${#STEPS_OK[@]} + ${#STEPS_FAIL[@]} )) total  |  ${#STEPS_OK[@]} OK  |  ${#STEPS_FAIL[@]} FAIL"
+        log "----------------------------------------"
+        for s in "${STEPS_OK[@]}";   do log "  [OK]   ${s}"; done
+        for s in "${STEPS_FAIL[@]}"; do log "  [FAIL] ${s}"; done
+        log "========================================"
+        log "Full log: ${LOG_FILE}"
+      }
+      trap print_summary EXIT
+
+      # flock prevents concurrent builds (e.g. null_resource + trigger-build.sh racing)
+      LOCKFILE=/tmp/build-ml2.lock
+      exec 200>"${LOCKFILE}"
+      flock -w 120 200 || { log "Could not acquire build lock after 120s — another build running?"; exit 1; }
+
+      log "Starting build-ml2.sh"
+      mkdir -p /opt/mltool
+      chmod 755 /opt/mltool
+
+      # build_tool name src_file output_binary module_name
+      # Clean rebuild each time (idempotent: rm -rf the build dir first)
+      build_tool() {
+        (
+          set -e
+          local name="$1" src="$2" bin="$3" mod="$4"
+          log "Building ${name}: ${src} -> ${bin}"
+          [ -f "${src}" ] || { log "ERROR: source ${src} not found"; exit 1; }
+          local dir="/opt/mltool/${mod}"
+          rm -rf "${dir}"
+          mkdir -p "${dir}"
+          cp "${src}" "${dir}/"
+          cd "${dir}"
+          go mod init "${mod}"
+          go mod tidy
+          go build -trimpath -ldflags "-s -w" -o "${bin}" .
+          chmod +x "${bin}"
+          log "${name} built OK -> ${bin}"
+        )
+      }
+
+      run_step "build ml2"    build_tool "ML-2"   /opt/mltool/ml2.go    /usr/local/bin/ml-2   ml2
+      run_step "build bots"   build_tool "Bots"   /opt/mltool/bots.go   /usr/local/bin/bots   bots
+      run_step "build ml-mix" build_tool "ML-Mix" /opt/mltool/ml-mix.go /usr/local/bin/ml-mix ml-mix
+
       install -d -m 0755 /opt/mltool/logs
-      
-      echo "[build-ml2] $(date -Is) All tools built successfully"
+      log "All builds complete"
 
   - path: /usr/local/bin/trigger-build.sh
     permissions: "0755"
     content: |
       #!/usr/bin/env bash
-      echo "[trigger-build] $(date -Is) Starting build process"
-      
-      # Wait for Go to be available (check multiple locations)
-      echo "[trigger-build] Waiting for Go installation..."
-      while ! (command -v go &> /dev/null || /usr/local/go/bin/go version &> /dev/null || /usr/bin/go version &> /dev/null); do
-        echo "[trigger-build] Go not found, checking locations..."
-        echo "[trigger-build] PATH: $PATH"
-        echo "[trigger-build] /usr/local/go/bin/go: $([ -f /usr/local/go/bin/go ] && echo 'exists' || echo 'missing')"
-        echo "[trigger-build] /usr/bin/go: $([ -f /usr/bin/go ] && echo 'exists' || echo 'missing')"
-        echo "[trigger-build] which go: $(which go 2>/dev/null || echo 'not found')"
-        echo "[trigger-build] Waiting 10 seconds..."
-        sleep 10
-      done
-      
-      # Determine which Go to use
-      if command -v go &> /dev/null; then
-        GO_CMD="go"
-        echo "[trigger-build] Go found in PATH: $(which go)"
-      elif /usr/local/go/bin/go version &> /dev/null; then
-        GO_CMD="/usr/local/go/bin/go"
-        echo "[trigger-build] Go found at: /usr/local/go/bin/go"
-      elif /usr/bin/go version &> /dev/null; then
-        GO_CMD="/usr/bin/go"
-        echo "[trigger-build] Go found at: /usr/bin/go"
-      else
-        echo "[trigger-build] ERROR: Go not found anywhere!"
-        exit 1
-      fi
-      
-      echo "[trigger-build] Go version: $($GO_CMD version)"
-      
-      # Wait a bit more for system to stabilize
-      sleep 5
-      
-      # Execute the build script
-      echo "[trigger-build] Executing build script..."
-      /usr/local/bin/build-ml2.sh
-      
-      echo "[trigger-build] Build process completed"
+      LOG_FILE="/var/log/trigger-build.log"
+      mkdir -p "$(dirname "$LOG_FILE")"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+      log(){ echo "[$(date -Is)] $*"; }
+      log "=== Starting trigger-build.sh ==="
+
+      # ── Step tracking ──────────────────────────────────────────────────────
+      STEPS_OK=(); STEPS_FAIL=()
+      run_step() {
+        local name="$1"; shift
+        log ">>> STEP START: ${name}"
+        local rc=0; "$@" || rc=$?
+        if [ $rc -eq 0 ]; then
+          log ">>> STEP OK:   ${name}"; STEPS_OK+=("${name}")
+        else
+          log ">>> STEP FAIL: ${name} (rc=${rc})"; STEPS_FAIL+=("${name}")
+        fi
+      }
+      print_summary() {
+        log ""; log "========================================"
+        log "TRIGGER-BUILD SUMMARY"
+        log "========================================"
+        log "Steps: $(( ${#STEPS_OK[@]} + ${#STEPS_FAIL[@]} )) total  |  ${#STEPS_OK[@]} OK  |  ${#STEPS_FAIL[@]} FAIL"
+        log "----------------------------------------"
+        for s in "${STEPS_OK[@]}";   do log "  [OK]   ${s}"; done
+        for s in "${STEPS_FAIL[@]}"; do log "  [FAIL] ${s}"; done
+        log "========================================"
+        log "Full log: ${LOG_FILE}"
+      }
+      trap print_summary EXIT
+
+      # ── 1. Wait for Go ────────────────────────────────────────────────────
+      step_wait_go() {
+        local i
+        for i in $(seq 1 60); do
+          /usr/local/go/bin/go version >/dev/null 2>&1 && return 0
+          /usr/bin/go version            >/dev/null 2>&1 && return 0
+          log "Waiting for Go... (${i}/60)"
+          sleep 10
+        done
+        log "Go not available after 600s"
+        return 1
+      }
+      run_step "wait for go" step_wait_go
+
+      # ── 2. Wait for source files (copied by Terraform null_resource) ──────
+      step_wait_sources() {
+        local i
+        for i in $(seq 1 60); do
+          if [ -f /opt/mltool/ml-mix.go ] && \
+             [ -f /opt/mltool/ml2.go ]    && \
+             [ -f /opt/mltool/bots.go ]; then
+            log "All source files present"
+            return 0
+          fi
+          log "Waiting for Go source files... (${i}/60) — missing: $(
+            for f in ml2.go bots.go ml-mix.go; do
+              [ -f /opt/mltool/$f ] || printf '%s ' $f
+            done)"
+          sleep 10
+        done
+        log "Source files not found after 600s"
+        return 1
+      }
+      run_step "wait for source files" step_wait_sources
+
+      # ── 3. Build ──────────────────────────────────────────────────────────
+      step_build() {
+        export PATH="/usr/local/go/bin:$PATH"
+        /usr/local/bin/build-ml2.sh
+      }
+      run_step "build ml tools" step_build
+
+      log "=== trigger-build.sh finished ==="
+
 runcmd:
   - bash /usr/local/bin/postprovision.sh
   - bash /usr/local/bin/trigger-build.sh
