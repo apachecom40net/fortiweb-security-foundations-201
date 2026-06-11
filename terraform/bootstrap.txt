@@ -68,7 +68,7 @@ write_files:
       # ── 3. Core packages ──────────────────────────────────────────────────
       step_packages() {
         apt-get install -y \
-          docker.io curl git jq netcat-openbsd \
+          docker.io curl git jq netcat-openbsd dbus-x11 \
           python3 python3-dev python3-pip python3-venv \
           wireshark wireshark-common burpsuite \
           kali-desktop-xfce xrdp xorgxrdp xfce4 xfce4-goodies
@@ -91,12 +91,18 @@ write_files:
       step_xrdp() {
         adduser xrdp ssl-cert || true
         echo "allowed_users=anybody" > /etc/X11/Xwrapper.config
-        sed -i.bak \
-          '/^test -r \/etc\/X11\/Xsession/d;/^exec \/bin\/sh \/etc\/X11\/Xsession/d' \
-          /etc/xrdp/startwm.sh
-        grep -q '^startxfce4' /etc/xrdp/startwm.sh || echo "startxfce4" >> /etc/xrdp/startwm.sh
+        cat > /etc/xrdp/startwm.sh << 'STARTWM'
+#!/bin/bash
+unset DBUS_SESSION_ADDRESS
+unset XDG_RUNTIME_DIR
+export XDG_RUNTIME_DIR=/tmp/.xrdp_${USER}
+mkdir -p $XDG_RUNTIME_DIR
+chmod 0700 $XDG_RUNTIME_DIR
+exec dbus-launch --exit-with-session startxfce4
+STARTWM
+        chmod +x /etc/xrdp/startwm.sh
         install -d -o "${ADMIN_USER}" -g "${ADMIN_USER}" "/home/${ADMIN_USER}"
-        echo "startxfce4" > "/home/${ADMIN_USER}/.xsession"
+        echo "exec dbus-launch --exit-with-session startxfce4" > "/home/${ADMIN_USER}/.xsession"
         chown "${ADMIN_USER}:${ADMIN_USER}" "/home/${ADMIN_USER}/.xsession"
         systemctl enable --now xrdp xrdp-sesman
       }
